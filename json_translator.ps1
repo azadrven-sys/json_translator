@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     JSON dosyalarındaki string değerleri hedef dile çevirir.
 
@@ -143,7 +143,8 @@ YARDIM PARAMETRESİNİN KONUMU:
         Önce işlem yapılır, sonra yardım gösterilir.
 
 ÇIKTI VE ÜZERİNE YAZMA KURALLARI:
-    - Giriş ve çıktı yolu birebir aynıysa dosyanın üzerine yazılmaz; dosya atlanır.
+    - Giriş ve çıktı yolu birebir aynıysa dosya yerinde çevrilir ve üzerine yazılır.
+    - Yerinde çeviri yapmadan önce önemli dosyalarınızın yedeğini alın.
     - Tek dosya girişinde -OutputDirectory sonunda \ veya / yoksa değer dosya yolu kabul edilir.
     - Çoklu girişte -OutputDirectory klasör kabul edilir.
     - Çıktı klasörü yoksa oluşturulur.
@@ -272,7 +273,8 @@ HELP POSITION:
         Processes files first, then shows help.
 
 OUTPUT AND OVERWRITE RULES:
-    - Input files are not overwritten when input and output paths are identical.
+    - If input and output paths are identical, the file is translated in place and overwritten.
+    - Back up important files before running in-place translation.
     - With a single input file, -OutputDirectory without trailing \ or / is treated as a file path.
     - With multiple inputs, -OutputDirectory is treated as a folder.
     - Missing output folders are created automatically.
@@ -887,14 +889,6 @@ foreach ($item in $inputItems) {
         continue
     }
     if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-
-    $samePath = $false
-    try { if ([System.IO.Path]::GetFullPath($outPath).ToLower() -eq [System.IO.Path]::GetFullPath($filePath).ToLower()) { $samePath = $true } } catch { $samePath = ($outPath -eq $filePath) }
-
-    if ($samePath) {
-        Write-Warning "Çıktı yolu giriş dosyası ile aynı; üzerine yazma yapılmayacak. Lütfen farklı bir -OutputDirectory belirtin. Dosya atlandı: $filePath"
-        continue
-    }
 
     # Collect unique strings to translate (skip numeric/whitespace-only tokens)
     $uniqueMap = @{}
