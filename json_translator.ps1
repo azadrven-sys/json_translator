@@ -168,7 +168,7 @@ VARSAYILANLAR:
 PERFORMANS:
     Benzersiz stringler önbelleğe alınır; aynı metin tekrar tekrar çevrilmez.
     Çeviri işleri paralel çalışır. Paralellik sayısını değiştirmek için ortam değişkeni kullanabilirsiniz:
-        `$env:TRANSLATE_MAX_PARALLEL = '2'
+        `$env:TRANSLATE_MAX_PARALLEL = '20'
 
 Desteklenen Diller:
     Çeviri servislerinin desteklediği ISO dil kodları kullanılabilir.
@@ -298,7 +298,7 @@ PROCESSING MODEL:
 PERFORMANCE:
     Unique strings are cached, so repeated text is translated once.
     Translation jobs run in parallel. To tune parallelism, set:
-        `$env:TRANSLATE_MAX_PARALLEL = '2'
+        `$env:TRANSLATE_MAX_PARALLEL = '20'
 
 Supported Languages:
     Use ISO language codes supported by the translation providers.
@@ -547,7 +547,7 @@ function Translate-TextsInParallel {
         [string[]]$texts,
         [string]$from,
         [string]$to,
-        [int]$maxParallel = 6
+        [int]$maxParallel = 20
     )
     $map = @{}
     if (-not $texts -or $texts.Count -eq 0) { return $map }
@@ -656,7 +656,7 @@ function Translate-TextsWithFallback {
         [string[]]$texts,
         [string]$from,
         [string]$to,
-        [int]$maxParallel = 3
+        [int]$maxParallel = 20
     )
 
     $map = Translate-TextsInParallel -texts $texts -from $from -to $to -maxParallel $maxParallel
@@ -761,17 +761,121 @@ function Get-OutputPathForInput {
     return Join-Path -Path $outDir -ChildPath (Split-Path -Path $filePath -Leaf)
 }
 
-function Get-ReadableJsonInputs {
+function Parse-SrtCues {
+    param([string]$content)
+    $lines = $content -split "\r?\n"
+    $cues = @()
+    $i = 0
+    while ($i -lt $lines.Length) {
+        if ([string]::IsNullOrWhiteSpace($lines[$i])) { $i++; continue }
+        $idxLine = $lines[$i].Trim()
+        $idx = $null
+        if ([regex]::IsMatch($idxLine, '^\d+$')) { $idx = [int]$idxLine; $i++ }
+        if ($i -ge $lines.Length) { break }
+        $timeLine = $lines[$i].Trim()
+        if (-not [regex]::IsMatch($timeLine, '^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}')) {
+            # invalid timecode, skip this block
+            $i++; continue
+        }
+        $i++
+        $textLines = @()
+        while ($i -lt $lines.Length -and -not [string]::IsNullOrWhiteSpace($lines[$i])) {
+            $textLines += $lines[$i]
+            $i++
+        }
+        $text = ($textLines -join "`n")
+        $cues += [pscustomobject]@{ Index = $idx; Time = $timeLine; Text = $text }
+    }
+    return $cues
+}
+
+function Parse-VttCues {
+    param([string]$content)
+    $lines = $content -split "\r?\n"
+    $cues = @()
+    $header = ''
+    $i = 0
+    # detect header (WEBVTT) and capture until first blank line
+    for ($j = 0; $j -lt $lines.Length; $j++) {
+        if (-not [string]::IsNullOrWhiteSpace($lines[$j])) { $i = $j; break }
+    }
+    if ($i -lt $lines.Length -and $lines[$i].TrimStart().ToUpper().StartsWith('WEBVTT')) {
+        $headerLines = @()
+        while ($i -lt $lines.Length) {
+            if ([string]::IsNullOrWhiteSpace($lines[$i])) { $i++; break }
+            $headerLines += $lines[$i]
+            $i++
+        }
+        $header = ($headerLines -join "`n")
+    } else { $i = 0 }
+
+    while ($i -lt $lines.Length) {
+        if ([string]::IsNullOrWhiteSpace($lines[$i])) { $i++; continue }
+        $possibleId = $lines[$i].Trim()
+        $timeLine = $null
+        if ($i+1 -lt $lines.Length -and [regex]::IsMatch($lines[$i+1], '^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}')) {
+            $cueId = $possibleId
+            $i++
+            $timeLine = $lines[$i].Trim()
+        } elseif ([regex]::IsMatch($lines[$i], '^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}')) {
+            $cueId = $null
+            $timeLine = $lines[$i].Trim()
+        } else {
+            $i++; continue
+        }
+        $i++
+        $textLines = @()
+        while ($i -lt $lines.Length -and -not [string]::IsNullOrWhiteSpace($lines[$i])) {
+            $textLines += $lines[$i]
+            $i++
+        }
+        $text = ($textLines -join "`n")
+        $cues += [pscustomobject]@{ Id = $cueId; Time = $timeLine; Text = $text }
+    }
+    return [pscustomobject]@{ Header = $header; Cues = $cues }
+}
+
+function Reconstruct-SrtContent {
+    param([array]$cues)
+    $parts = @()
+    $counter = 1
+    foreach ($c in $cues) {
+        $index = if ($c.Index) { $c.Index } else { $counter }
+        $parts += $index
+        $parts += $c.Time
+        $parts += ($c.Text -replace "`n", "`r`n")
+        $parts += ""
+        $counter++
+    }
+    return ($parts -join "`r`n")
+}
+
+function Reconstruct-VttContent {
+    param([string]$header, [array]$cues)
+    $parts = @()
+    if ($header) { $parts += $header; $parts += "" }
+    foreach ($c in $cues) {
+        if ($c.Id) { $parts += $c.Id }
+        $parts += $c.Time
+        $parts += ($c.Text -replace "`n", "`r`n")
+        $parts += ""
+    }
+    return ($parts -join "`r`n")
+}
+
+function Get-ReadableInputs {
     param([string[]]$paths)
     $items = @()
     $candidateCount = @($paths).Count
     foreach ($filePath in $paths) {
         if (-not (Test-Path $filePath -PathType Leaf)) { continue }
         $isJsonNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.json')
+        $isVttNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.vtt')
+        $isSrtNamedFile = ([IO.Path]::GetExtension($filePath).ToLower() -eq '.srt')
         try {
             $bytes = [System.IO.File]::ReadAllBytes($filePath)
         } catch {
-            if ($candidateCount -eq 1 -or $isJsonNamedFile) { Write-Warning "Dosya okunamadı: $filePath" }
+            if ($candidateCount -eq 1 -or $isJsonNamedFile -or $isVttNamedFile -or $isSrtNamedFile) { Write-Warning "Dosya okunamadı: $filePath" }
             continue
         }
 
@@ -780,21 +884,72 @@ function Get-ReadableJsonInputs {
         $bom = $encInfo.Bom
         $content = $enc.GetString($bytes, $bom, $bytes.Length - $bom)
 
+        $format = 'unknown'
+        $jsonObj = $null
         try {
             $jsonObj = $content | ConvertFrom-Json -ErrorAction Stop
+            $format = 'json'
         } catch {
-            if ($candidateCount -eq 1 -or $isJsonNamedFile) { Write-Warning "Okunabilir JSON değil, atlandı: $filePath" }
-            continue
+            $firstNonEmpty = ($content -split "(\r?\n)" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+            if ($firstNonEmpty -and $firstNonEmpty.TrimStart().ToUpper().StartsWith('WEBVTT')) { $format = 'vtt' }
+            elseif ([regex]::IsMatch($content, '^\s*\d+\s*\r?\n\s*\d{2}:\d{2}:\d{2},\d{3}\s*-->', [System.Text.RegularExpressions.RegexOptions]::Multiline)) { $format = 'srt' }
+            if ($format -eq 'unknown') {
+                if ($isVttNamedFile) { $format = 'vtt' }
+                elseif ($isSrtNamedFile) { $format = 'srt' }
+                elseif ($isJsonNamedFile) {
+                    if ($candidateCount -eq 1) { Write-Warning "Okunabilir JSON değil, atlandı: $filePath" }
+                    continue
+                }
+            }
         }
 
-        $items += [pscustomobject]@{
-            Path = $filePath
-            Bytes = $bytes
-            EncodingInfo = $encInfo
-            Encoding = $enc
-            Bom = $bom
-            Content = $content
-            Json = $jsonObj
+        if ($format -eq 'json') {
+            $items += [pscustomobject]@{
+                Path = $filePath
+                Bytes = $bytes
+                EncodingInfo = $encInfo
+                Encoding = $enc
+                Bom = $bom
+                Content = $content
+                Json = $jsonObj
+                Format = 'json'
+            }
+        } elseif ($format -eq 'vtt') {
+            $parsed = Parse-VttCues -content $content
+            if (-not $parsed -or -not $parsed.Cues) {
+                if ($candidateCount -eq 1 -or $isVttNamedFile) { Write-Warning "VTT içeriği anlaşılamadı, atlandı: $filePath" }
+                continue
+            }
+            $items += [pscustomobject]@{
+                Path = $filePath
+                Bytes = $bytes
+                EncodingInfo = $encInfo
+                Encoding = $enc
+                Bom = $bom
+                Content = $content
+                Header = $parsed.Header
+                Cues = $parsed.Cues
+                Format = 'vtt'
+            }
+        } elseif ($format -eq 'srt') {
+            $cues = Parse-SrtCues -content $content
+            if (-not $cues -or $cues.Count -eq 0) {
+                if ($candidateCount -eq 1 -or $isSrtNamedFile) { Write-Warning "SRT içeriği anlaşılamadı, atlandı: $filePath" }
+                continue
+            }
+            $items += [pscustomobject]@{
+                Path = $filePath
+                Bytes = $bytes
+                EncodingInfo = $encInfo
+                Encoding = $enc
+                Bom = $bom
+                Content = $content
+                Cues = $cues
+                Format = 'srt'
+            }
+        } else {
+            if ($candidateCount -eq 1) { Write-Warning "Desteklenmeyen içerik, atlandı: $filePath" }
+            continue
         }
     }
     return $items
@@ -862,10 +1017,10 @@ if (-not $OutputLanguage) {
 }
 
 $files = Resolve-InputFiles -pattern $InputDirectory
-if (-not $files -or $files.Count -eq 0) { Write-Error "JSON dosyası bulunamadı: $InputDirectory"; exit 1 }
+if (-not $files -or $files.Count -eq 0) { Write-Error "Girdi dosyası bulunamadı: $InputDirectory"; exit 1 }
 
-$inputItems = Get-ReadableJsonInputs -paths $files
-if (-not $inputItems -or $inputItems.Count -eq 0) { Write-Error "Okunabilir JSON dosyası bulunamadı: $InputDirectory"; exit 1 }
+$inputItems = Get-ReadableInputs -paths $files
+if (-not $inputItems -or $inputItems.Count -eq 0) { Write-Error "Okunabilir girdi dosyası bulunamadı: $InputDirectory"; exit 1 }
 
 $inputValueIsSingleFile = Test-InputValueIsSingleFile -pattern $InputDirectory
 
@@ -874,10 +1029,11 @@ foreach ($item in $inputItems) {
     $enc = $item.Encoding
     $bom = $item.Bom
     $content = $item.Content
-    $jsonObj = $item.Json
+    $format = $item.Format
 
     # detect language (use provided InputLanguage if present)
-    $detected = if ($InputLanguage) { $InputLanguage } else { Detect-LanguageFromText -text $content }
+    if ($format -eq 'json') { $textForDetect = $content } elseif ($format -in @('srt','vtt')) { $textForDetect = ($item.Cues | ForEach-Object { $_.Text }) -join ' ' } else { $textForDetect = $content }
+    $detected = if ($InputLanguage) { $InputLanguage } else { Detect-LanguageFromText -text $textForDetect }
 
     # Determine output path early so we can decide copy/skip vs translate
     $outPath = Get-OutputPathForInput -filePath $filePath -inputPattern $InputDirectory -outputPattern $OutputDirectory -outputSpecified $outputSpecified -inputValueIsSingleFile $inputValueIsSingleFile
@@ -892,14 +1048,19 @@ foreach ($item in $inputItems) {
 
     # Collect unique strings to translate (skip numeric/whitespace-only tokens)
     $uniqueMap = @{}
-    Collect-UniqueStrings $jsonObj ([ref]$uniqueMap)
     $textsToTranslate = @()
-    if ($uniqueMap.Keys.Count -gt 0) { $textsToTranslate = $uniqueMap.Keys }
+    if ($format -eq 'json') {
+        Collect-UniqueStrings $item.Json ([ref]$uniqueMap)
+        if ($uniqueMap.Keys.Count -gt 0) { $textsToTranslate = $uniqueMap.Keys }
+    } elseif ($format -in @('srt','vtt')) {
+        foreach ($c in $item.Cues) { if (-not (Should-SkipTranslation $c.Text)) { $uniqueMap[$c.Text] = $true } }
+        if ($uniqueMap.Keys.Count -gt 0) { $textsToTranslate = $uniqueMap.Keys }
+    }
     Write-Host "Unique strings found: $($textsToTranslate.Count)"
 
     # Translate unique texts in parallel and fill cache
     Write-Host "Fetching translations..."
-    $maxParallel = if ($env:TRANSLATE_MAX_PARALLEL) { [int]$env:TRANSLATE_MAX_PARALLEL } else { 3 }
+    $maxParallel = if ($env:TRANSLATE_MAX_PARALLEL) { [int]$env:TRANSLATE_MAX_PARALLEL } else { 20 }
     $translations = Translate-TextsWithFallback -texts $textsToTranslate -from $detected -to $OutputLanguage -maxParallel $maxParallel
     $successCount = 0
     foreach ($k in $translations.Keys) { 
@@ -912,39 +1073,58 @@ foreach ($item in $inputItems) {
         $translationCache["$detected|$OutputLanguage|$k"] = $val
     }
     Write-Host "Successful translations: $successCount / $($textsToTranslate.Count)"
-    
-    
-    # Surgical replacement to preserve formatting, comments and indentation
-    # We replace only the values that were successfully translated
-    $pattern = '(?<prefix>(?::|[\[,])\s*)"(?<content>(?:[^"\\\\]|\\\\.)*)"(?=\s*(?:[,\]\}]|$))'
-    
-    $jsonText = [regex]::Replace($content, $pattern, {
-        param($m)
-        $prefix = $m.Groups['prefix'].Value
-        $rawContent = $m.Groups['content'].Value
-        
-        # Robust unescape using PowerShell's JSON engine to match cache keys exactly
-        try { 
-            # We wrap in quotes and let ConvertFrom-Json handle all JSON escape sequences
-            $unescaped = '"' + $rawContent + '"' | ConvertFrom-Json 
-        } catch { 
-            # Fallback to manual for simple cases if JSON engine fails (should not happen for valid JSON)
-            $unescaped = $rawContent.Replace('\"', '"').Replace('\\', '\').Replace('\n', "`n").Replace('\r', "`r").Replace('\t', "`t")
-        }
-        
-        $cacheKey = "$detected|$OutputLanguage|$unescaped"
-        if ($translationCache.ContainsKey($cacheKey)) {
-            $translated = $translationCache[$cacheKey]
-            if ($null -ne $translated) {
-                return $prefix + '"' + (Escape-JsonString $translated) + '"'
-            }
-        }
-        return $m.Value
-    })
 
-    $preamble = $enc.GetPreamble()
-    $outBytes = $enc.GetBytes($jsonText)
-    if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
+    # Apply translations
+    if ($format -eq 'json') {
+        # Surgical replacement to preserve formatting, comments and indentation
+        $pattern = '(?<prefix>(?::|[\[,])\s*)"(?<content>(?:[^"\\]|\\.)*)"(?=\s*(?:[,\]\}]|$))'
+        $outText = [regex]::Replace($content, $pattern, {
+            param($m)
+            $prefix = $m.Groups['prefix'].Value
+            $rawContent = $m.Groups['content'].Value
+            try { $unescaped = '"' + $rawContent + '"' | ConvertFrom-Json } catch { $unescaped = $rawContent.Replace('\\"', '"').Replace('\\\\', '\\').Replace('\\n', "`n").Replace('\\r', "`r").Replace('\\t', "`t") }
+            $cacheKey = "$detected|$OutputLanguage|$unescaped"
+            if ($translationCache.ContainsKey($cacheKey)) {
+                $translated = $translationCache[$cacheKey]
+                if ($null -ne $translated) { return $prefix + '"' + (Escape-JsonString $translated) + '"' }
+            }
+            return $m.Value
+        })
+        $preamble = $enc.GetPreamble()
+        $outBytes = $enc.GetBytes($outText)
+        if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
+    } elseif ($format -eq 'srt') {
+        foreach ($c in $item.Cues) {
+            $orig = $c.Text
+            $cacheKey = "$detected|$OutputLanguage|$orig"
+            $translated = $null
+            if ($translationCache.ContainsKey($cacheKey)) { $translated = $translationCache[$cacheKey] }
+            elseif ($translations.ContainsKey($orig)) { $translated = $translations[$orig] }
+            if ($null -eq $translated -and -not $SkipOnError) { Write-Error -Message "ERROR: Translation failed for cue text: '$orig'"; exit 2 }
+            if ($null -ne $translated) { $c.Text = $translated }
+        }
+        $outText = Reconstruct-SrtContent -cues $item.Cues
+        $preamble = $enc.GetPreamble()
+        $outBytes = $enc.GetBytes($outText)
+        if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
+    } elseif ($format -eq 'vtt') {
+        foreach ($c in $item.Cues) {
+            $orig = $c.Text
+            $cacheKey = "$detected|$OutputLanguage|$orig"
+            $translated = $null
+            if ($translationCache.ContainsKey($cacheKey)) { $translated = $translationCache[$cacheKey] }
+            elseif ($translations.ContainsKey($orig)) { $translated = $translations[$orig] }
+            if ($null -eq $translated -and -not $SkipOnError) { Write-Error -Message "ERROR: Translation failed for cue text: '$orig'"; exit 2 }
+            if ($null -ne $translated) { $c.Text = $translated }
+        }
+        $outText = Reconstruct-VttContent -header $item.Header -cues $item.Cues
+        $preamble = $enc.GetPreamble()
+        $outBytes = $enc.GetBytes($outText)
+        if ($preamble.Length -gt 0 -and $bom -gt 0) { $final = $preamble + $outBytes } else { $final = $outBytes }
+    } else {
+        Write-Warning "Desteklenmeyen format: $format - atlandı: $filePath"
+        continue
+    }
 
     try {
         [System.IO.File]::WriteAllBytes($outPath, $final)
